@@ -7,6 +7,7 @@ const wrongSound = document.getElementById('wrongSound');
 
 // Game settings
 let gameRunning = false;
+let showGameScreen = false; // New state for showing game screen with small button
 let score = 0;
 let currentTargetLetter;
 let letters = [];
@@ -15,6 +16,15 @@ let targetDisplay = {
     text: ''
 };
 
+// Parachute management
+let parachutesSpawned = 0;
+let maxParachutesAtOnce = 3;
+let canSpawnNewParachutes = true;
+
+// Tune how close a parachute must get to the slate before counting as a hit
+// This reduces the visual gap caused by image padding
+const PARACHUTE_TOUCH_OFFSET_PX = 35;
+
 // Characters collected on the slate
 let collectedCharacters = [];
 const MAX_CHARACTERS = 4;
@@ -22,7 +32,7 @@ const MAX_CHARACTERS = 4;
 // Slate object (controlled by player)
 const slate = {
     x: canvas.width / 2 - 50,
-    y: canvas.height * 0.7 - 10, // Position on top of water, not inside
+    y: canvas.height * 0.57 - 10, // Slightly higher above the water
     width: 100,
     height: 20,
     speed: 5,
@@ -80,9 +90,66 @@ const MAX_MISSES = 4;
 // Audio control
 let soundInterval = null;
 let currentAudio = null;
+// Prefer female TTS for letter pronunciation
+let preferFemaleTTS = true;
+let selectedHindiFemaleVoice = null;
+
+// Get audio elements from DOM
+const headingSound = document.getElementById('headingSound');
+const waterDropSound = new Audio('sounds/water.mp3');
+
+// Track if heading sound has been played
+let headingSoundPlayed = false;
+
+// Load and select a female Hindi voice if available
+function pickHindiFemaleVoice() {
+    if (!('speechSynthesis' in window)) return null;
+    const voices = window.speechSynthesis.getVoices();
+    if (!voices || voices.length === 0) return null;
+
+    const hindiVoices = voices.filter(v => (v.lang || '').toLowerCase().startsWith('hi'));
+    // Heuristics for female-sounding voices by common names/labels
+    const femaleHints = ['female', 'woman', 'kalpana', 'swara', 'neerja', 'shruti', 'ananya', 'pallavi', 'indraja'];
+    let preferred = null;
+    for (const v of hindiVoices) {
+        const name = (v.name || '').toLowerCase();
+        if (femaleHints.some(h => name.includes(h))) {
+            preferred = v; break;
+        }
+    }
+    // Fallback to Google Hindi or first Hindi voice
+    if (!preferred) {
+        preferred = hindiVoices.find(v => (v.name || '').toLowerCase().includes('google')) || hindiVoices[0] || null;
+    }
+    return preferred || null;
+}
+
+function ensureVoiceSelected() {
+    if (!selectedHindiFemaleVoice) {
+        selectedHindiFemaleVoice = pickHindiFemaleVoice();
+    }
+}
+
+if ('speechSynthesis' in window) {
+    // Some browsers populate voices asynchronously
+    window.speechSynthesis.onvoiceschanged = () => {
+        selectedHindiFemaleVoice = pickHindiFemaleVoice();
+    };
+}
 
 // Water splash effects
 let waterSplashes = [];
+let splashAnimations = []; // Track splash gif animations
+let wrongLetterAnimations = []; // Track wrong letter animations
+let rocks = []; // Track falling rocks
+let slateBroken = false; // Track if slate is broken
+let slateRepairTime = 0; // Track slate repair timing
+let slatePieces = []; // Track broken slate pieces
+// Hide game bodies during reset sequence after a wrong collection
+let hideBodiesDuringReset = false;
+let restartScheduled = false;
+// Control whether the game auto-restarts after a wrong collection
+const AUTO_RESTART_ON_WRONG = false;
 
 // Update octopus chances display and wooden slates
 function updateOctopusChances() {
@@ -96,26 +163,12 @@ function updateOctopusChances() {
 function updateChancesBar() {
     const slates = document.querySelectorAll('.chance-slate');
     slates.forEach((slate, idx) => {
-        // Remove any previous cross
-        let cross = slate.parentElement.querySelector('.slate-cross[data-index="' + idx + '"]');
-        if (cross) cross.remove();
-        // If this miss has occurred, overlay a cross
+        // If this miss has occurred, replace the wooden slate with woodenslatecancel image
         if (idx < misses) {
-            const crossMark = document.createElement('span');
-            crossMark.className = 'slate-cross';
-            crossMark.setAttribute('data-index', idx);
-            crossMark.textContent = '✕';
-            crossMark.style.position = 'absolute';
-            crossMark.style.left = (slate.offsetLeft + 33) + 'px';
-            crossMark.style.top = (slate.offsetTop + 10) + 'px';
-            crossMark.style.fontSize = '28px';
-            crossMark.style.color = '#FF0000';
-            crossMark.style.fontWeight = 'bold';
-            crossMark.style.textShadow = '2px 2px 4px rgba(0,0,0,0.8)';
-            crossMark.style.pointerEvents = 'none';
-            crossMark.style.userSelect = 'none';
-            crossMark.style.zIndex = 20;
-            slate.parentElement.appendChild(crossMark);
+            slate.src = 'images/woodenslatecancel.png';
+        } else {
+            // Reset to normal wooden slate if no miss
+            slate.src = 'images/woodenslate.png';
         }
     });
 }
@@ -132,9 +185,22 @@ characterImage.src = 'images/character.png';
 
 const backgroundImage = new Image();
 backgroundImage.src = 'images/background.svg';
+// Ensure the first screen redraws with the background once it loads
+backgroundImage.onload = () => {
+    // Only redraw the idle screen; gameplay has its own loop
+    if (!gameRunning) {
+        drawGame();
+    }
+};
 
 const turtleImage = new Image();
 turtleImage.src = 'images/turtleimg.png';
+
+const chapakGif = new Image();
+chapakGif.src = 'images/chapak-unscreen.gif';
+
+const waterGif = new Image();
+waterGif.src = 'images/water.gif';
 
 // Key states for movement
 const keys = {
@@ -144,6 +210,23 @@ const keys = {
 
 // Event listeners
 playButton.addEventListener('click', startGame);
+
+// Add canvas click event listener for the small start button
+canvas.addEventListener('click', (e) => {
+    if (showGameScreen && !gameRunning && window.smallButtonCoords) {
+        const rect = canvas.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        const y = e.clientY - rect.top;
+        
+        // Check if click is within the small button area
+        if (x >= window.smallButtonCoords.x && 
+            x <= window.smallButtonCoords.x + window.smallButtonCoords.width &&
+            y >= window.smallButtonCoords.y && 
+            y <= window.smallButtonCoords.y + window.smallButtonCoords.height) {
+            startGame(); // This will call actuallyStartGame() since showGameScreen is true
+        }
+    }
+});
 
 // Replay sound button removed as requested
 
@@ -201,25 +284,91 @@ window.addEventListener('DOMContentLoaded', () => {
     }
 });
 
+// Play heading sound when page loads (NOT when Play button is clicked)
+function playHeadingSound() {
+    // Don't play heading sound if game is running
+    if (gameRunning) {
+        console.log('Game is running, skipping heading sound');
+        return;
+    }
+
+    if (headingSoundPlayed) return; // Don't play if already played
+
+    console.log('Attempting to play heading sound...');
+    try {
+        if (!headingSound) {
+            console.log('Heading sound element not found');
+            return;
+        }
+        headingSound.currentTime = 0; // Reset to beginning
+        headingSound.play().then(() => {
+            console.log('Heading sound played successfully');
+            headingSoundPlayed = true;
+        }).catch(e => {
+            console.log('Could not play heading sound automatically:', e);
+            // If automatic play fails, set up click handler for first user interaction
+            setupClickToPlayAnywhere();
+        });
+    } catch (e) {
+        console.log('Heading sound not available:', e);
+        setupClickToPlayAnywhere();
+    }
+}
+
+// Setup click/touch handler to play heading sound on first user interaction
+function setupClickToPlayAnywhere() {
+    if (headingSoundPlayed || gameRunning || !headingSound) return;
+
+    const playOnInteraction = () => {
+        // Don't play heading sound if game is running
+        if (gameRunning) {
+            console.log('Game is running, removing interaction handler for heading sound');
+            cleanupHandlers();
+            return;
+        }
+
+        if (!headingSoundPlayed) {
+            headingSound.play().then(() => {
+                console.log('Heading sound played on first interaction');
+                headingSoundPlayed = true;
+                cleanupHandlers();
+            }).catch(e => {
+                console.log('Still could not play heading sound:', e);
+            });
+        }
+    };
+
+    const cleanupHandlers = () => {
+        document.removeEventListener('click', playOnInteraction);
+        document.removeEventListener('touchstart', playOnInteraction);
+        document.removeEventListener('keydown', playOnInteraction);
+    };
+
+    // Add multiple event listeners to capture any user interaction
+    document.addEventListener('click', playOnInteraction);
+    document.addEventListener('touchstart', playOnInteraction);
+    document.addEventListener('keydown', playOnInteraction);
+
+    // Remove handlers after some time if not triggered
+    setTimeout(cleanupHandlers, 30000); // 30 seconds
+}
+
 // Game functions
 function startGame() {
-    if (!gameRunning) {
-        // Stop any existing sounds
-        stopRepeatingSound();
-        
-        gameRunning = true;
-        score = 0;
-        letters = [];
-        collectedCharacters = [];
-        targetDisplay.visible = false;
+    if (!gameRunning && !showGameScreen) {
+        // First click on Play button - play heading sound and show game screen
+        playHeadingSound();
+        showGameScreen = true;
         playButton.textContent = 'Restart';
-        misses = 0; // Reset misses to 0
-        updateOctopusChances();
-        generateNewTargetLetter();
-        gameLoop();
-    } else {
+        console.log('Heading sound played, showing game screen with small button');
+        drawGame(); // Redraw to show the game screen
+    } else if (showGameScreen && !gameRunning) {
+        // Click on the small start button - actually start the game
+        actuallyStartGame();
+    } else if (gameRunning) {
         // Restart the game - but prevent infinite loop
         gameRunning = false;
+        showGameScreen = false;
         stopRepeatingSound(); // Stop sounds when restarting
         setTimeout(() => {
             startGame();
@@ -227,57 +376,89 @@ function startGame() {
     }
 }
 
+function actuallyStartGame() {
+    // Stop any existing sounds
+    stopRepeatingSound();
+
+    gameRunning = true;
+    showGameScreen = false;
+    score = 0;
+    letters = [];
+    collectedCharacters = [];
+    targetDisplay.visible = false;
+    misses = 0; // Reset misses to 0
+    parachutesSpawned = 0; // Reset parachute count
+    canSpawnNewParachutes = true; // Allow spawning new parachutes
+    splashAnimations = []; // Reset splash animations
+    wrongLetterAnimations = []; // Reset wrong letter animations
+    rocks = []; // Reset rocks
+    slateBroken = false; // Reset slate state
+    slateRepairTime = 0; // Reset repair time
+    slatePieces = []; // Reset slate pieces
+
+    // Debug canvas dimensions
+    console.log(`Canvas dimensions: ${canvas.width}x${canvas.height}, water level: ${canvas.height * 0.7}`);
+
+    updateOctopusChances();
+    // Target letter will be selected when first parachute is created
+    gameLoop();
+}
+
 function generateNewTargetLetter() {
     const randomIndex = Math.floor(Math.random() * hindiLetters.length);
     currentTargetLetter = hindiLetters[randomIndex];
-    
+
     // Update the target display
     targetDisplay.visible = true;
     targetDisplay.text = `Listen and collect: ${currentTargetLetter.letter}`;
-    
-    // Play the sound of the letter
-    playLetterSound(currentTargetLetter.sound);
-    
-    console.log(`Listen to sound: ${currentTargetLetter.sound} and collect the letter: ${currentTargetLetter.letter}`);
+
+    // Voice will be played when the first parachute of the batch is created
+    console.log(`Target letter set: ${currentTargetLetter.sound} (${currentTargetLetter.letter})`);
 }
 
-function playLetterSound(sound) {
+function playLetterSound(sound, devanagari) {
     // Stop any existing sound
     stopRepeatingSound();
-    
+
+    // Prefer TTS with a female voice when possible
+    if (preferFemaleTTS && 'speechSynthesis' in window) {
+        ensureVoiceSelected();
+        startRepeatingSpeech(sound, devanagari);
+        return;
+    }
+
     try {
         // Try to play the audio file for the letter sound
         currentAudio = new Audio(`sounds/${sound}.mp3`);
+        // Make the pronunciation faster without changing pitch significantly
+        try { currentAudio.playbackRate = 1.5; } catch (e) {}
+        if ('preservesPitch' in currentAudio) {
+            try { currentAudio.preservesPitch = false; } catch (e) {}
+        }
+        // Repeat the audio more frequently by looping continuously
+        currentAudio.loop = true;
         currentAudio.play().catch(e => {
             console.log('Audio file not found, using text-to-speech fallback');
             // Fallback to text-to-speech if audio file doesn't exist
-            startRepeatingSpeech(sound);
+            startRepeatingSpeech(sound, devanagari);
         });
-        
-        // Set up repeating audio
-        currentAudio.addEventListener('ended', () => {
-            if (currentAudio && gameRunning) {
-                currentAudio.currentTime = 0;
-                currentAudio.play();
-            }
-        });
-        
+
     } catch (e) {
         console.log('Audio not available, using text-to-speech');
-        startRepeatingSpeech(sound);
+        startRepeatingSpeech(sound, devanagari);
     }
 }
 
-function startRepeatingSpeech(sound) {
-    // Repeat speech every 3 seconds
+function startRepeatingSpeech(sound, devanagari) {
+    // Repeat speech more frequently (every 1.5 seconds)
     soundInterval = setInterval(() => {
         if (gameRunning) {
-            speakLetter(sound);
+            speakLetter(sound, devanagari);
         }
-    }, 3000);
-    
+    }, 1500);
+
     // Play immediately
-    speakLetter(sound);
+    speakLetter(sound, devanagari);
 }
 
 function stopRepeatingSound() {
@@ -287,7 +468,7 @@ function stopRepeatingSound() {
         currentAudio.currentTime = 0;
         currentAudio = null;
     }
-    
+
     // Stop speech interval
     if (soundInterval) {
         clearInterval(soundInterval);
@@ -295,14 +476,18 @@ function stopRepeatingSound() {
     }
 }
 
-function speakLetter(sound) {
+function speakLetter(sound, devanagari) {
     // Use Web Speech API as fallback
     if ('speechSynthesis' in window) {
-        const cleanSound = sound.replace(/_/g, ' '); // Replace underscores with spaces
-        const utterance = new SpeechSynthesisUtterance(cleanSound);
+        // Use Devanagari letter for TTS if available
+        const utterance = new SpeechSynthesisUtterance(devanagari || sound.replace(/_/g, ' '));
         utterance.lang = 'hi-IN'; // Hindi language
-        utterance.rate = 0.7; // Slower speech
+        // Speak faster to reduce time per repetition
+        utterance.rate = 1.3;
         utterance.pitch = 1.0;
+        if (selectedHindiFemaleVoice) {
+            utterance.voice = selectedHindiFemaleVoice;
+        }
         speechSynthesis.speak(utterance);
     } else {
         console.log('Speech synthesis not supported');
@@ -310,36 +495,88 @@ function speakLetter(sound) {
 }
 
 function createLetter() {
-    if (!gameRunning) return;
-    
-    // Randomly select if this will be the target letter or a different one
+    if (!gameRunning || !canSpawnNewParachutes) return;
+
+    // Create three different letters for the batch
     let letterObj;
-    const isTarget = Math.random() < 0.3; // 30% chance of being the target letter
-    
-    if (isTarget) {
-        letterObj = currentTargetLetter;
-    } else {
-        // Select a random letter that is not the target
-        let randomIndex;
+    if (parachutesSpawned === 0) {
+        // First parachute - random letter
+        const randomIndex1 = Math.floor(Math.random() * hindiLetters.length);
+        letterObj = hindiLetters[randomIndex1];
+    } else if (parachutesSpawned === 1) {
+        // Second parachute - different random letter
+        let randomIndex2;
         do {
-            randomIndex = Math.floor(Math.random() * hindiLetters.length);
-        } while (hindiLetters[randomIndex].letter === currentTargetLetter.letter);
-        
-        letterObj = hindiLetters[randomIndex];
+            randomIndex2 = Math.floor(Math.random() * hindiLetters.length);
+        } while (hindiLetters[randomIndex2].letter === letters[0].letter);
+        letterObj = hindiLetters[randomIndex2];
+    } else {
+        // Third parachute - different random letter
+        let randomIndex3;
+        do {
+            randomIndex3 = Math.floor(Math.random() * hindiLetters.length);
+        } while (hindiLetters[randomIndex3].letter === letters[0].letter ||
+            hindiLetters[randomIndex3].letter === letters[1].letter);
+        letterObj = hindiLetters[randomIndex3];
     }
-    
+
+    let newX;
+    const parachuteWidth = 160;
+    const minGap = 400; // Much larger gap - 400 pixels between parachutes
+    const margin = 100; // Much larger margin from screen edges
+
+    if (letters.length === 0) {
+        // First parachute - place it on the left side
+        newX = margin;
+    } else if (letters.length === 1) {
+        // Second parachute - place it on the right side
+        newX = canvas.width - parachuteWidth - margin;
+    } else {
+        // Third parachute - place it in the middle
+        newX = (canvas.width - parachuteWidth) / 2;
+    }
+
+    // Ensure it doesn't go off screen
+    newX = Math.max(margin, Math.min(newX, canvas.width - parachuteWidth - margin));
+    // Determine if this parachute should be the target (voice) letter
+    // We'll randomly select one of the three parachutes to be the target
+    let isTarget = false;
+    if (parachutesSpawned === 0) {
+        // Randomly decide if the first parachute should be the target
+        isTarget = Math.random() < 0.33; // 33% chance
+    } else if (parachutesSpawned === 1) {
+        // If first wasn't target, this one has 50% chance
+        isTarget = !letters[0].isTarget && Math.random() < 0.5;
+    } else {
+        // If neither first nor second was target, this one must be target
+        isTarget = !letters[0].isTarget && !letters[1].isTarget;
+    }
+
     const letter = {
-        x: Math.random() * (canvas.width - 100) + 50,
-        y: -100,
+        x: newX,
+        y: -50, // Start from behind the top border instead of far above
         width: 160, // Increased width
         height: 130, // Increased height
         letter: letterObj.letter,
         isTarget: isTarget,
-        speed: 0.7 + Math.random() * 0.7, // Reduced speed
+        speed: 0.5 + Math.random() * 0.5, // Slightly faster speed
         collected: false
     };
-    
     letters.push(letter);
+    parachutesSpawned++;
+    console.log(`Spawned parachute ${parachutesSpawned}/${maxParachutesAtOnce} at x:${newX}, y:-100, size:${letter.width}x${letter.height}`);
+
+    // Play the voice only for the target parachute
+    if (isTarget) {
+        console.log(`Playing voice for target letter: ${letterObj.sound} (${letterObj.letter})`);
+        playLetterSound(letterObj.sound, letterObj.letter);
+    }
+
+    // If we've spawned the maximum number of parachutes, stop spawning
+    if (parachutesSpawned >= maxParachutesAtOnce) {
+        canSpawnNewParachutes = false;
+        console.log('Reached maximum parachutes, stopping spawn');
+    }
 }
 
 function updateGame() {
@@ -350,28 +587,26 @@ function updateGame() {
     if (keys.ArrowRight && slate.x < canvas.width - slate.width) {
         slate.x += slate.speed;
     }
-    
+
     // Update letters position and check for collisions
     for (let i = 0; i < letters.length; i++) {
         const letter = letters[i];
-        
+
         if (!letter.collected) {
             letter.y += letter.speed;
-            
-            // Check for collision with slate
-            if (letter.y + letter.height > slate.y && 
-                letter.y < slate.y + slate.height && 
-                letter.x + letter.width > slate.x && 
+
+            // Check for collision with slate (use offset to reduce visual gap)
+            if (letter.y + letter.height - PARACHUTE_TOUCH_OFFSET_PX > slate.y &&
+                letter.y < slate.y + slate.height &&
+                letter.x + letter.width > slate.x &&
                 letter.x < slate.x + slate.width) {
-                
+
                 letter.collected = true;
-                
+
                 if (letter.isTarget) {
                     // Stop the repeating sound when correct letter is collected
                     stopRepeatingSound();
-                    
-                    // Correct letter collected
-                    score++;
+
                     // Try to play the correct sound if available
                     if (correctSound) {
                         try {
@@ -381,15 +616,19 @@ function updateGame() {
                         }
                     }
                     console.log('Correct letter collected!');
-                    
+
                     // Add character to the collected characters array
                     collectedCharacters.push({
                         letter: letter.letter,
                         x: slate.x + (collectedCharacters.length * 25) // Position characters side by side
                     });
-                    
+
                     // Check if we've collected the maximum number of characters
                     if (collectedCharacters.length >= MAX_CHARACTERS) {
+                        // Update score to show multiples of 4 (4, 8, 12, etc.)
+                        score += 4;
+                        console.log('4 letters collected! Score updated to:', score);
+
                         // Instead of congratulating, decrement a chance and reset collectedCharacters
                         misses = Math.min(MAX_MISSES, misses + 1);
                         updateOctopusChances();
@@ -400,7 +639,7 @@ function updateGame() {
                             return;
                         }
                     }
-                    
+
                     // Generate a new target letter (which will start the new sound)
                     generateNewTargetLetter();
                     // Remove the collected letter from the array
@@ -415,8 +654,14 @@ function updateGame() {
                             console.log('Could not play sound:', e);
                         }
                     }
+
+                    // Create a falling rock from above the slate
+                    createRock(slate.x + slate.width / 2, slate.y - 100);
+
                     misses = Math.min(MAX_MISSES, misses + 1);
                     updateOctopusChances();
+                    // Lose progress: clear collected characters so player starts again
+                    collectedCharacters = [];
                     console.log('Wrong letter collected!');
                     // End game if max misses reached
                     if (misses >= MAX_MISSES) {
@@ -430,36 +675,61 @@ function updateGame() {
                 }
             }
         }
-        
-        // Check if letter hits the water
-        if (letter.y > canvas.height * 0.7) {
-            // Create water splash effect
-            createWaterSplash(letter.x + letter.width / 2, canvas.height * 0.7);
-            
+
+        // Check if letter hits the water (adjust for parachute height)
+        const waterLevel = canvas.height * 0.7;
+        const parachuteBottom = letter.y + letter.height;
+
+        if (parachuteBottom > waterLevel) {
+            console.log(`Parachute hit water at x:${letter.x}, y:${letter.y}, waterLevel:${waterLevel}`);
+            // Create water splash effect at the water surface
+            createWaterSplash(letter.x + letter.width / 2, waterLevel);
+
+            // Create splash animation with chapak gif at water surface
+            createSplashAnimation(letter.x + letter.width / 2, waterLevel);
+
             // Play drop sound
             playDropSound();
-            
+
             // Remove the letter (make it invisible)
             letters.splice(i, 1);
             i--;
         }
     }
-    
-    // SAFEGUARD: Only stop parachutes if all chances are missed
-    if (misses < MAX_MISSES && gameRunning !== false) {
-        while (letters.length < 4) {
-            createLetter();
-        }
+
+    // Check if all parachutes have dropped and we can spawn new ones
+    if (letters.length === 0 && canSpawnNewParachutes === false) {
+        // All parachutes have dropped, reset for next batch
+        parachutesSpawned = 0;
+        canSpawnNewParachutes = true;
+        console.log('All parachutes dropped, spawning new batch of 3');
     }
-    
+
+    // Spawn new parachutes only if we can and haven't reached the limit
+    if (canSpawnNewParachutes && parachutesSpawned < maxParachutesAtOnce && misses < MAX_MISSES && gameRunning !== false) {
+        createLetter();
+    }
+
     // Update water splashes
     updateWaterSplashes();
+
+    // Update splash animations
+    updateSplashAnimations();
+
+    // Update wrong letter animations
+    updateWrongLetterAnimations();
+
+    // Update rocks
+    updateRocks();
+
+    // Update slate pieces
+    updateSlatePieces();
 }
 
 function drawGame() {
     // Clear canvas
     ctx.clearRect(0, 0, canvas.width, canvas.height);
-    
+
     // Draw background
     if (backgroundImage.complete) {
         ctx.drawImage(backgroundImage, 0, 0, canvas.width, canvas.height);
@@ -467,163 +737,216 @@ function drawGame() {
         // Fallback if image not loaded
         ctx.fillStyle = '#87CEEB'; // Sky blue
         ctx.fillRect(0, 0, canvas.width, canvas.height * 0.7);
-        
+
         ctx.fillStyle = '#0077BE'; // Deep blue for water
         ctx.fillRect(0, canvas.height * 0.7, canvas.width, canvas.height * 0.3);
-        
-        // Draw some clouds
-        ctx.fillStyle = 'white';
-        drawCloud(100, 50, 70);
-        drawCloud(300, 80, 60);
-        drawCloud(500, 60, 80);
-        drawCloud(700, 100, 50);
-        
-        // Draw a small raft in the water
-        ctx.fillStyle = '#8B4513'; // Brown
-        ctx.fillRect(canvas.width / 2 - 40, canvas.height * 0.7 - 10, 80, 20);
-        
-        // Draw character on raft
-        ctx.fillStyle = '#FFA500'; // Orange
-        ctx.fillRect(canvas.width / 2 - 10, canvas.height * 0.7 - 30, 20, 20); // Head
-        ctx.fillRect(canvas.width / 2 - 5, canvas.height * 0.7 - 10, 10, 10); // Body
     }
-    
-    // Draw the slate
-    if (slateImage.complete) {
-        ctx.drawImage(slateImage, slate.x, slate.y, slate.width, slate.height);
+
+    // Always draw the slate (wooden plank)
+    if (!slateBroken) {
+        if (slateImage.complete) {
+            ctx.drawImage(slateImage, slate.x, slate.y, slate.width, slate.height);
+        } else {
+            ctx.fillStyle = '#8B4513'; // Brown for wooden slate
+            ctx.fillRect(slate.x, slate.y, slate.width, slate.height);
+        }
+    } else if (slatePieces.length > 0) {
+        // Draw slate pieces instead of broken slate
+        drawSlatePieces();
     } else {
-        ctx.fillStyle = '#8B4513'; // Brown for wooden slate
+        // Draw broken slate (fallback)
+        ctx.fillStyle = '#654321'; // Darker brown for broken slate
         ctx.fillRect(slate.x, slate.y, slate.width, slate.height);
+
+        // Draw cracks on the slate
+        ctx.strokeStyle = '#000000';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(slate.x + slate.width * 0.3, slate.y);
+        ctx.lineTo(slate.x + slate.width * 0.3, slate.y + slate.height);
+        ctx.moveTo(slate.x + slate.width * 0.7, slate.y);
+        ctx.lineTo(slate.x + slate.width * 0.7, slate.y + slate.height);
+        ctx.stroke();
     }
-    
-    // Draw collected characters on the slate
-    if (collectedCharacters.length > 0) {
-        const charWidth = 100;
-        const charHeight = 70;
+
+    // Draw collected characters on the slate (only when visible and slate intact)
+    if (gameRunning && !hideBodiesDuringReset && !slateBroken && collectedCharacters.length > 0) {
+        const charWidth = 120; // Increased size
+        const charHeight = 84; // Increased size proportionally
         const spacing = 25; // Space between characters
-        
+
         // Calculate starting position to center the characters on the slate
         const totalWidth = collectedCharacters.length * spacing;
         const startX = slate.x + (slate.width / 2) - (totalWidth / 2) + (spacing / 2);
-        
+
         collectedCharacters.forEach((char, index) => {
             if (characterImage.complete) {
-                // Draw the character image on the slate
-                ctx.drawImage(characterImage, 
-                    startX + (index * spacing) - charWidth / 2, 
-                    slate.y - charHeight + slate.height, // Feet on the slate
+                // Draw only the character image on the slate (no letter text)
+                ctx.drawImage(characterImage,
+                    startX + (index * spacing) - charWidth / 2,
+                    slate.y - charHeight + slate.height,
                     charWidth, charHeight);
-                
-                // Draw the letter above the character
-                ctx.fillStyle = 'black';
-                ctx.font = 'bold 16px Arial';
-                ctx.textAlign = 'center';
-                ctx.fillText(char.letter, startX + (index * spacing), slate.y - charHeight - 10);
             } else {
-                // Fallback if image not loaded
-                ctx.fillStyle = '#FFA500'; // Orange
-                ctx.fillRect(startX + (index * spacing) - 10, slate.y - 25, 20, 20); // Head
-                ctx.fillRect(startX + (index * spacing) - 5, slate.y - 5, 10, 10); // Body
-                
-                // Draw the letter above the character
-                ctx.fillStyle = 'black';
-                ctx.font = 'bold 16px Arial';
-                ctx.textAlign = 'center';
-                ctx.fillText(char.letter, startX + (index * spacing), slate.y - 45);
+                // Fallback simple body without letter text
+                ctx.fillStyle = '#FFA500';
+                ctx.fillRect(startX + (index * spacing) - 10, slate.y - 25, 20, 20);
+                ctx.fillRect(startX + (index * spacing) - 5, slate.y - 5, 10, 10);
             }
         });
     }
-    
-    // Draw letters with parachutes
-    letters.forEach(letter => {
-        if (!letter.collected) {
-            if (parachuteImage.complete) {
-                // Use the parachute SVG image
-                ctx.save();
-                // Apply color tint based on whether it's the target letter
-                if (letter.isTarget) {
-                    ctx.filter = 'hue-rotate(0deg)'; // Keep pink color for target
-                } else {
-                    ctx.filter = 'hue-rotate(60deg)'; // Yellow tint for non-target
-                }
-                ctx.drawImage(parachuteImage, letter.x, letter.y, letter.width, letter.height);
+
+    // Only draw letters with parachutes when game is running
+    if (gameRunning && !hideBodiesDuringReset) {
+        letters.forEach(letter => {
+            if (!letter.collected) {
+                if (parachuteImage.complete) {
+                    // Use the parachute SVG image
+                    ctx.save();
+                    // Apply color tint based on whether it's the target letter
+                    if (letter.isTarget) {
+                        ctx.filter = 'hue-rotate(0deg)'; // Keep pink color for target
+                    } else {
+                        ctx.filter = 'hue-rotate(60deg)'; // Yellow tint for non-target
+                    }
+                    ctx.drawImage(parachuteImage, letter.x, letter.y, letter.width, letter.height);
                     ctx.restore();
-                
-                // Draw letter text on top of the parachute
-                ctx.fillStyle = 'black';
-                ctx.font = 'bold 20px Arial';
-                ctx.textAlign = 'center';
-                ctx.textBaseline = 'middle';
-                ctx.fillText(letter.letter, letter.x + letter.width / 2, letter.y + 40);
-            } else {
-                // Fallback if image not loaded
-                // Draw parachute
-                ctx.fillStyle = letter.isTarget ? '#FF69B4' : '#FFFF00'; // Pink for target, yellow for others
-                ctx.beginPath();
-                ctx.arc(letter.x + letter.width / 2, letter.y + 10, 30, 0, Math.PI, true);
-                ctx.fill();
-                
-                // Draw strings
-                ctx.strokeStyle = 'black';
-                ctx.beginPath();
-                ctx.moveTo(letter.x + letter.width / 2 - 20, letter.y + 10);
-                ctx.lineTo(letter.x + letter.width / 2 - 5, letter.y + 40);
-                ctx.stroke();
-                
-                ctx.beginPath();
-                ctx.moveTo(letter.x + letter.width / 2 + 20, letter.y + 10);
-                ctx.lineTo(letter.x + letter.width / 2 + 5, letter.y + 40);
-                ctx.stroke();
-                
-                // Draw letter circle
-                ctx.fillStyle = letter.isTarget ? '#FF69B4' : '#FFFF00';
-                ctx.beginPath();
-                ctx.arc(letter.x + letter.width / 2, letter.y + 40, 20, 0, Math.PI * 2);
-                ctx.fill();
-                
-                // Draw letter text
-                ctx.fillStyle = 'black';
-                ctx.font = 'bold 20px Arial';
-                ctx.textAlign = 'center';
-                ctx.textBaseline = 'middle';
-                ctx.fillText(letter.letter, letter.x + letter.width / 2, letter.y + 40);
+
+                    // Draw letter text on top of the parachute
+                    ctx.fillStyle = 'black';
+                    ctx.font = 'bold 20px Arial';
+                    ctx.textAlign = 'center';
+                    ctx.textBaseline = 'middle';
+                    ctx.fillText(letter.letter, letter.x + letter.width / 2, letter.y + 40);
+                } else {
+                    // Fallback if image not loaded
+                    // Draw parachute
+                    ctx.fillStyle = letter.isTarget ? '#FF69B4' : '#FFFF00'; // Pink for target, yellow for others
+                    ctx.beginPath();
+                    ctx.arc(letter.x + letter.width / 2, letter.y + 10, 30, 0, Math.PI, true);
+                    ctx.fill();
+
+                    // Draw strings
+                    ctx.strokeStyle = 'black';
+                    ctx.beginPath();
+                    ctx.moveTo(letter.x + letter.width / 2 - 20, letter.y + 10);
+                    ctx.lineTo(letter.x + letter.width / 2 - 5, letter.y + 40);
+                    ctx.stroke();
+
+                    ctx.beginPath();
+                    ctx.moveTo(letter.x + letter.width / 2 + 20, letter.y + 10);
+                    ctx.lineTo(letter.x + letter.width / 2 + 5, letter.y + 40);
+                    ctx.stroke();
+
+                    // Draw letter circle
+                    ctx.fillStyle = letter.isTarget ? '#FF69B4' : '#FFFF00';
+                    ctx.beginPath();
+                    ctx.arc(letter.x + letter.width / 2, letter.y + 40, 20, 0, Math.PI * 2);
+                    ctx.fill();
+
+                    // Draw letter text
+                    ctx.fillStyle = 'black';
+                    ctx.font = 'bold 20px Arial';
+                    ctx.textAlign = 'center';
+                    ctx.textBaseline = 'middle';
+                    ctx.fillText(letter.letter, letter.x + letter.width / 2, letter.y + 40);
+                }
             }
-        }
-    });
-    
+        });
+    }
+
     // Target letter indicator removed as requested
-    
+
     // Draw instructions if game is not running
     if (!gameRunning) {
-        ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
-        
-        // Center the play button on the canvas
-        playButton.style.display = 'block';
-        playButton.style.position = 'absolute';
-        playButton.style.left = '50%';
-        playButton.style.top = '50%';
-        playButton.style.transform = 'translate(-50%, -50%)';
-        playButton.style.zIndex = '100';
-        playButton.style.padding = '20px 40px';
-        playButton.style.fontSize = '24px';
-        playButton.style.backgroundColor = '#4CAF50';
-        playButton.style.color = 'white';
-        playButton.style.border = 'none';
-        playButton.style.borderRadius = '10px';
-        playButton.style.cursor = 'pointer';
-        playButton.style.boxShadow = '0 4px 8px rgba(0,0,0,0.3)';
-        playButton.textContent = 'Play';
+        if (!showGameScreen) {
+            // Initial state - show play button overlay
+            // Draw a semi-transparent overlay for the play button area
+            ctx.fillStyle = 'rgba(0, 0, 0, 0.3)';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            // Center the play button on the canvas
+            playButton.style.display = 'block';
+            playButton.style.position = 'absolute';
+            playButton.style.left = '50%';
+            playButton.style.top = '50%';
+            playButton.style.transform = 'translate(-50%, -50%)';
+            playButton.style.zIndex = '100';
+            playButton.style.padding = '25px 50px';
+            playButton.style.fontSize = '28px';
+            playButton.style.fontWeight = 'bold';
+            playButton.style.backgroundColor = '#3498db';
+            playButton.style.color = 'white';
+            playButton.style.border = 'none';
+            playButton.style.borderRadius = '15px';
+            playButton.style.cursor = 'pointer';
+            playButton.style.boxShadow = '0 6px 20px rgba(0,0,0,0.3)';
+            playButton.style.transition = 'all 0.3s ease';
+            playButton.textContent = 'Start Game';
+        } else {
+            // Game screen state - hide play button overlay and show small button inside canvas
+            playButton.style.display = 'none';
+            
+            // Draw a small start button inside the canvas
+            drawSmallStartButton();
+        }
     } else {
         // Hide the play button during game play
         playButton.style.display = 'none';
     }
-    
+
     // Draw water splashes
     drawWaterSplashes();
-    
+
+    // Draw splash animations
+    drawSplashAnimations();
+
+    // Draw wrong letter animations
+    if (!hideBodiesDuringReset) {
+        drawWrongLetterAnimations();
+    }
+
+    // Draw rocks
+    drawRocks();
+
     // Draw the turtle image and score outside the canvas (on the page)
     drawTurtleOnBorder();
+}
+
+function drawSmallStartButton() {
+    // Draw a small start button in the center of the canvas, slightly upward
+    const buttonX = canvas.width / 2 - 60;
+    const buttonY = canvas.height / 2 - 50; // Moved upward by 30 pixels
+    const buttonWidth = 120;
+    const buttonHeight = 40;
+    const borderRadius = 8; // Border radius for rounded corners
+    
+    // Draw button background with rounded corners
+    ctx.fillStyle = '#3498db';
+    ctx.beginPath();
+    ctx.roundRect(buttonX, buttonY, buttonWidth, buttonHeight, borderRadius);
+    ctx.fill();
+    
+    // Draw button border with rounded corners
+    ctx.strokeStyle = '#2980b9';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.roundRect(buttonX, buttonY, buttonWidth, buttonHeight, borderRadius);
+    ctx.stroke();
+    
+    // Draw button text
+    ctx.fillStyle = 'white';
+    ctx.font = 'bold 16px Arial';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('Play', canvas.width / 2, canvas.height / 2 - 30); // Adjusted text position
+    
+    // Store button coordinates for click detection
+    window.smallButtonCoords = {
+        x: buttonX,
+        y: buttonY,
+        width: buttonWidth,
+        height: buttonHeight
+    };
 }
 
 function drawTurtleOnBorder() {
@@ -631,7 +954,7 @@ function drawTurtleOnBorder() {
         // Get the canvas container position
         const canvasRect = canvas.getBoundingClientRect();
         const gameArea = canvas.parentElement;
-        
+
         // Create or get existing turtle element
         let turtleElement = document.getElementById('turtleScoreDisplay');
         if (!turtleElement) {
@@ -653,17 +976,17 @@ function drawTurtleOnBorder() {
             turtleElement.style.textShadow = '2px 2px 4px rgba(0,0,0,0.8)';
             gameArea.appendChild(turtleElement);
         }
-        
-        // Position turtle on the bottom right of the brown border area
+
+        // Position turtle on the bottom right of the game area
         turtleElement.style.right = '20px';
-        turtleElement.style.bottom = '-10px'; // Move up so legs are visible
+        turtleElement.style.bottom = '50px'; // Position at bottom of game area
         turtleElement.style.overflow = 'visible'; // Allow overflow
         turtleElement.style.pointerEvents = 'none'; // Prevent interaction issues
         turtleElement.style.textAlign = 'center';
         turtleElement.style.paddingTop = '80px'; // Move score text lower on the board
         turtleElement.style.paddingLeft = '40px'; // Move score text right to align with board
         turtleElement.textContent = ''; // Clear any existing text
-        
+
         // Remove previous score span if it exists
         let scoreSpan = turtleElement.querySelector('.turtle-score');
         if (!scoreSpan) {
@@ -678,7 +1001,12 @@ function drawTurtleOnBorder() {
             scoreSpan.style.textShadow = '2px 2px 4px rgba(0,0,0,0.8)';
             turtleElement.appendChild(scoreSpan);
         }
-        scoreSpan.textContent = score;
+        // Only show score when it's a multiple of 4 (4, 8, 12, etc.)
+        if (score > 0 && score % 4 === 0) {
+            scoreSpan.textContent = score;
+        } else {
+            scoreSpan.textContent = ''; // Hide score when not a multiple of 4
+        }
         turtleElement.style.textAlign = '';
         turtleElement.style.paddingTop = '';
         turtleElement.style.paddingLeft = '';
@@ -699,7 +1027,7 @@ function createWaterSplash(x, y) {
     for (let i = 0; i < 15; i++) {
         const angle = (Math.PI * 2 * i) / 15; // Distribute particles in a circle
         const speed = Math.random() * 8 + 4; // Random speed
-        
+
         waterSplashes.push({
             x: x,
             y: y,
@@ -712,7 +1040,7 @@ function createWaterSplash(x, y) {
             hasBounced: false
         });
     }
-    
+
     // Add some smaller secondary droplets
     for (let i = 0; i < 8; i++) {
         waterSplashes.push({
@@ -729,31 +1057,255 @@ function createWaterSplash(x, y) {
     }
 }
 
+function createSplashAnimation(x, y) {
+    // Create a splash animation with the chapak gif
+    const splashAnim = {
+        x: x - 50, // Center the gif on the splash point
+        y: y - 50,
+        width: 100,
+        height: 100,
+        life: 1.0,
+        duration: 2000, // 2 seconds
+        startTime: Date.now()
+    };
+
+    splashAnimations.push(splashAnim);
+    console.log('Created splash animation at', x, y);
+}
+
+function createWrongLetterAnimation(x, y) {
+    // Create a wrong letter animation with the water gif
+    const wrongAnim = {
+        x: x - 40, // Center the gif on the slate
+        y: y - 40,
+        width: 80,
+        height: 80,
+        life: 1.0,
+        duration: 1500, // 1.5 seconds
+        startTime: Date.now()
+    };
+
+    wrongLetterAnimations.push(wrongAnim);
+    console.log('Created wrong letter animation at', x, y);
+}
+
+function createRock(x, y) {
+    // Create a falling rock
+    const rock = {
+        x: x,
+        y: y,
+        width: 30,
+        height: 30,
+        speed: 3,
+        rotation: 0,
+        rotationSpeed: 0.1,
+        hasHitSlate: false
+    };
+
+    rocks.push(rock);
+    console.log('Created rock at', x, y);
+}
+
+function createSlateBreakingEffect(x, y) {
+    // Create slate breaking particles
+    for (let i = 0; i < 8; i++) {
+        const angle = (Math.PI * 2 * i) / 8;
+        const speed = Math.random() * 6 + 3;
+
+        waterSplashes.push({
+            x: x,
+            y: y,
+            vx: Math.cos(angle) * speed,
+            vy: Math.sin(angle) * speed - 2,
+            life: 1.0,
+            size: Math.random() * 4 + 2,
+            gravity: 0.3,
+            bounce: 0.2,
+            hasBounced: false
+        });
+    }
+}
+
+function createSlatePieces() {
+    // Clear existing pieces
+    slatePieces = [];
+
+    const currentTime = Date.now();
+
+    // Create left piece
+    const leftPiece = {
+        x: slate.x,
+        y: slate.y,
+        width: slate.width / 2,
+        height: slate.height,
+        vx: -2, // Move left
+        vy: 1, // Slight downward movement
+        rotation: -0.2, // Rotate left
+        rotationSpeed: 0.05,
+        life: 1.0,
+        duration: 3000, // 3 seconds
+        startTime: currentTime
+    };
+
+    // Create right piece
+    const rightPiece = {
+        x: slate.x + slate.width / 2,
+        y: slate.y,
+        width: slate.width / 2,
+        height: slate.height,
+        vx: 2, // Move right
+        vy: 1, // Slight downward movement
+        rotation: 0.2, // Rotate right
+        rotationSpeed: -0.05,
+        life: 1.0,
+        duration: 3000, // 3 seconds
+        startTime: currentTime
+    };
+
+    slatePieces.push(leftPiece, rightPiece);
+    console.log('Created slate pieces');
+}
+
 function updateWaterSplashes() {
     for (let i = waterSplashes.length - 1; i >= 0; i--) {
         const splash = waterSplashes[i];
-        
+
         // Update position
         splash.x += splash.vx;
         splash.y += splash.vy;
         splash.vy += splash.gravity; // Variable gravity
-        
+
         // Bounce effect when hitting water surface
         if (splash.y >= canvas.height * 0.7 && !splash.hasBounced && splash.vy > 0) {
             splash.vy *= -splash.bounce; // Bounce with energy loss
             splash.vx *= 0.8; // Reduce horizontal velocity
             splash.hasBounced = true;
         }
-        
+
         // Air resistance
         splash.vx *= 0.99;
-        
+
         // Fade out over time
         splash.life -= 0.015;
-        
+
         // Remove old splashes
         if (splash.life <= 0 || splash.y > canvas.height + 50) {
             waterSplashes.splice(i, 1);
+        }
+    }
+}
+
+function updateSplashAnimations() {
+    const currentTime = Date.now();
+
+    for (let i = splashAnimations.length - 1; i >= 0; i--) {
+        const anim = splashAnimations[i];
+        const elapsed = currentTime - anim.startTime;
+
+        // Calculate life based on elapsed time
+        anim.life = Math.max(0, 1 - (elapsed / anim.duration));
+
+        // Remove expired animations
+        if (anim.life <= 0) {
+            splashAnimations.splice(i, 1);
+        }
+    }
+}
+
+function updateWrongLetterAnimations() {
+    const currentTime = Date.now();
+
+    for (let i = wrongLetterAnimations.length - 1; i >= 0; i--) {
+        const anim = wrongLetterAnimations[i];
+        const elapsed = currentTime - anim.startTime;
+
+        // Calculate life based on elapsed time
+        anim.life = Math.max(0, 1 - (elapsed / anim.duration));
+
+        // Remove expired animations
+        if (anim.life <= 0) {
+            wrongLetterAnimations.splice(i, 1);
+        }
+    }
+}
+
+function updateRocks() {
+    for (let i = rocks.length - 1; i >= 0; i--) {
+        const rock = rocks[i];
+
+        // Update rock position and rotation
+        rock.y += rock.speed;
+        rock.rotation += rock.rotationSpeed;
+
+        // Check if rock hits the slate
+        if (!rock.hasHitSlate &&
+            rock.y + rock.height > slate.y &&
+            rock.y < slate.y + slate.height &&
+            rock.x + rock.width > slate.x &&
+            rock.x < slate.x + slate.width) {
+
+            rock.hasHitSlate = true;
+            slateBroken = true;
+            slateRepairTime = Date.now() + 2000; // Repair after 2 seconds
+            console.log('Rock hit slate! Slate is broken!');
+
+            // Create slate breaking particles
+            createSlateBreakingEffect(slate.x + slate.width / 2, slate.y + slate.height / 2);
+
+            // Create two slate pieces
+            createSlatePieces();
+
+            // Optionally auto-restart; by default keep playing and only show broken slate effect
+            if (AUTO_RESTART_ON_WRONG) {
+                hideBodiesDuringReset = true;
+                stopRepeatingSound();
+                letters = []; // Hide remaining parachutes immediately
+                if (!restartScheduled) {
+                    restartScheduled = true;
+                    setTimeout(() => {
+                        restartScheduled = false;
+                        hideBodiesDuringReset = false;
+                        startGame();
+                    }, 1200);
+                }
+            }
+        }
+
+        // Remove rock if it goes below the water
+        if (rock.y > canvas.height) {
+            rocks.splice(i, 1);
+        }
+    }
+
+    // Check if slate should be repaired
+    if (slateBroken && Date.now() > slateRepairTime) {
+        slateBroken = false;
+        slatePieces = []; // Clear slate pieces
+        console.log('Slate repaired!');
+    }
+}
+
+function updateSlatePieces() {
+    const currentTime = Date.now();
+
+    for (let i = slatePieces.length - 1; i >= 0; i--) {
+        const piece = slatePieces[i];
+
+        // Update position
+        piece.x += piece.vx;
+        piece.y += piece.vy;
+        piece.rotation += piece.rotationSpeed;
+
+        // Add gravity
+        piece.vy += 0.1;
+
+        // Fade out over time
+        const elapsed = currentTime - (piece.startTime || currentTime);
+        piece.life = Math.max(0, 1 - (elapsed / piece.duration));
+
+        // Remove expired pieces
+        if (piece.life <= 0 || piece.y > canvas.height) {
+            slatePieces.splice(i, 1);
         }
     }
 }
@@ -762,47 +1314,142 @@ function drawWaterSplashes() {
     waterSplashes.forEach(splash => {
         ctx.save();
         ctx.globalAlpha = splash.life;
-        
+
         // Create more realistic water droplet shape
         const gradient = ctx.createRadialGradient(
-            splash.x - splash.size/3, splash.y - splash.size/3, 0,
+            splash.x - splash.size / 3, splash.y - splash.size / 3, 0,
             splash.x, splash.y, splash.size
         );
         gradient.addColorStop(0, '#E6F7FF'); // Light blue center
         gradient.addColorStop(0.7, '#87CEEB'); // Medium blue
         gradient.addColorStop(1, '#4682B4'); // Darker blue edge
-        
+
         ctx.fillStyle = gradient;
         ctx.beginPath();
-        
+
         // Draw teardrop shape for more realistic water droplets
         if (splash.vy > 0) { // Falling droplets are teardrop shaped
             ctx.ellipse(splash.x, splash.y, splash.size, splash.size * 1.5, 0, 0, Math.PI * 2);
         } else { // Rising droplets are more circular
             ctx.arc(splash.x, splash.y, splash.size, 0, Math.PI * 2);
         }
-        
+
         ctx.fill();
-        
+
         // Add highlight for more realistic look
         ctx.fillStyle = 'rgba(255, 255, 255, 0.6)';
         ctx.beginPath();
-        ctx.arc(splash.x - splash.size/3, splash.y - splash.size/3, splash.size/3, 0, Math.PI * 2);
+        ctx.arc(splash.x - splash.size / 3, splash.y - splash.size / 3, splash.size / 3, 0, Math.PI * 2);
         ctx.fill();
-        
+
+        ctx.restore();
+    });
+}
+
+function drawSplashAnimations() {
+    splashAnimations.forEach(anim => {
+        ctx.save();
+        ctx.globalAlpha = anim.life;
+
+        // Draw the chapak gif animation
+        if (chapakGif.complete) {
+            ctx.drawImage(chapakGif, anim.x, anim.y, anim.width, anim.height);
+        } else {
+            // Fallback if gif not loaded - draw a simple splash circle
+            ctx.fillStyle = '#87CEEB';
+            ctx.beginPath();
+            ctx.arc(anim.x + anim.width / 2, anim.y + anim.height / 2, anim.width / 2, 0, Math.PI * 2);
+            ctx.fill();
+        }
+
+        ctx.restore();
+    });
+}
+
+function drawWrongLetterAnimations() {
+    wrongLetterAnimations.forEach(anim => {
+        ctx.save();
+        ctx.globalAlpha = anim.life;
+
+        // Draw the water gif animation
+        if (waterGif.complete) {
+            ctx.drawImage(waterGif, anim.x, anim.y, anim.width, anim.height);
+        } else {
+            // Fallback if gif not loaded - draw a simple water circle
+            ctx.fillStyle = '#0077BE';
+            ctx.beginPath();
+            ctx.arc(anim.x + anim.width / 2, anim.y + anim.height / 2, anim.width / 2, 0, Math.PI * 2);
+            ctx.fill();
+        }
+
+        ctx.restore();
+    });
+}
+
+function drawRocks() {
+    rocks.forEach(rock => {
+        ctx.save();
+
+        // Move to rock center for rotation
+        ctx.translate(rock.x + rock.width / 2, rock.y + rock.height / 2);
+        ctx.rotate(rock.rotation);
+
+        // Draw rock
+        ctx.fillStyle = '#696969'; // Dark gray
+        ctx.beginPath();
+        ctx.arc(0, 0, rock.width / 2, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Add rock texture
+        ctx.fillStyle = '#808080'; // Light gray
+        ctx.beginPath();
+        ctx.arc(-5, -5, 3, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.beginPath();
+        ctx.arc(5, 5, 2, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.restore();
+    });
+}
+
+function drawSlatePieces() {
+    slatePieces.forEach(piece => {
+        ctx.save();
+        ctx.globalAlpha = piece.life;
+
+        // Move to piece center for rotation
+        ctx.translate(piece.x + piece.width / 2, piece.y + piece.height / 2);
+        ctx.rotate(piece.rotation);
+
+        // Draw slate piece
+        ctx.fillStyle = '#8B4513'; // Brown for wooden slate
+        ctx.fillRect(-piece.width / 2, -piece.height / 2, piece.width, piece.height);
+
+        // Add wood grain
+        ctx.strokeStyle = '#654321';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        for (let i = 0; i < 3; i++) {
+            const y = -piece.height / 2 + (i + 1) * piece.height / 4;
+            ctx.moveTo(-piece.width / 2, y);
+            ctx.lineTo(piece.width / 2, y);
+        }
+        ctx.stroke();
+
         ctx.restore();
     });
 }
 
 function playDropSound() {
     try {
-        // Try to play drop sound
-        const dropSound = new Audio('sounds/drop.mp3');
-        dropSound.play().catch(e => {
-            console.log('Drop sound not found');
+        // Play water drop sound
+        waterDropSound.currentTime = 0; // Reset to beginning
+        waterDropSound.play().catch(e => {
+            console.log('Could not play water sound:', e);
         });
     } catch (e) {
-        console.log('Drop sound not available');
+        console.log('Water sound not available');
     }
 }
 
@@ -827,12 +1474,32 @@ function hideGameOverBox() {
     if (box) box.style.display = 'none';
 }
 
+// Reset heading sound state when the page is shown (useful for back/forward navigation)
+function resetHeadingSoundState() {
+    // Reset the flag but only if the page is being shown (not just refreshed)
+    if (document.visibilityState === 'visible') {
+        headingSoundPlayed = false;
+        console.log('Heading sound state reset - will play only when Start Game is clicked');
+        // Don't play automatically - only when Start Game is clicked
+    }
+}
+
 // At the end of window.onload or DOMContentLoaded
 window.addEventListener('DOMContentLoaded', () => {
+    // Don't play heading sound automatically - only when Start Game is clicked
+    console.log('Page loaded, heading sound will play only when Start Game is clicked');
+
+    // Add additional fallback for when the page becomes visible (e.g., after redirect)
+    window.addEventListener('pageshow', resetHeadingSoundState);
+    document.addEventListener('visibilitychange', resetHeadingSoundState);
+
     const okBtn = document.getElementById('gameOverOkButton');
     if (okBtn) {
         okBtn.addEventListener('click', () => {
             hideGameOverBox();
+            // Reset states when game over
+            gameRunning = false;
+            showGameScreen = false;
             startGame();
         });
     }
